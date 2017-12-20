@@ -1,0 +1,39 @@
+composition
+
+import Fugue.AWS.Pattern.Network as Network
+import Fugue.AWS.IAM as IAM
+import Fugue.AWS.ECS as ECS
+import Fugue.AWS as AWS
+
+import AppCluster
+
+network: Network.new {
+  name: "App",
+  cidr: "10.0.0.0/16",
+  region: AWS.Us-east-1,
+  publicSubnets: [
+    (AWS.A, "10.0.0.0/24"),
+  ],
+  privateSubnets: [
+    (AWS.A, "10.0.10.0/24"),
+  ],
+  enableNat: True,
+  enableDnsSupport: True,
+  enableDnsHostnames: True,
+}
+
+cluster: AppCluster.new {
+  name: "app",
+  network: network,
+  size: 1,
+  keyName: "Demo",
+  apps: [
+    AppCluster.app {
+      name: "containerApp",
+      image: "ubuntu",
+      memory: 256,
+      port: 8080,
+      managedPolicies: [],
+    }
+  ]
+}
