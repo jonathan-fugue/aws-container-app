@@ -5,13 +5,13 @@ export
     type AppCluster
     new
 
+import Fugue.AWS.Pattern.Network
 import Fugue.AWS
 import Fugue.AWS.AutoScaling
 import Fugue.AWS.EC2
 import Fugue.AWS.ECS
 import Fugue.AWS.ELB
 import Fugue.AWS.IAM
-import Fugue.AWS.Pattern.Network
 import Fugue.Core.Vars
 
 # An app is basically a docker image together with some parameters.  You can
@@ -60,11 +60,12 @@ fun app {
     managedPolicies: managedPolicies ?| []
   }
 
-type AppCluster: {
-  cluster: Fugue.AWS.ECS.Cluster,
-  services: List<Fugue.AWS.ECS.Service>,
-  asg: Fugue.AWS.AutoScaling.AutoScalingGroup
-}
+type AppCluster:
+  | AppCluster {
+      cluster: Fugue.AWS.ECS.Cluster,
+      services: List<Fugue.AWS.ECS.Service>,
+      asg: Fugue.AWS.AutoScaling.AutoScalingGroup
+    }
 
 # Create a new `AppCluster`
 #
@@ -76,16 +77,22 @@ type AppCluster: {
 # 1.
 fun new {
   name: String,
-  network: Fugue.AWS.Pattern.Network.Network,
+  subnets: List<Fugue.AWS.EC2.Subnet>,
+  vpc: Optional<Fugue.AWS.EC2.Vpc>,
+  region: Optional<Fugue.AWS.Region>,
   apps: List<App>,
   size: Optional<Int>,
-  keyName: Optional<String>
+  keyName: Optional<String>,
+  tags: Optional<List<Fugue.AWS.Tag>>
 } -> AppCluster:
+  let _vpc: vpc ?| List.index(subnets,0).(Fugue.AWS.EC2.Subnet).vpc
+  let _region: region ?| _vpc.(Fugue.AWS.EC2.Vpc).region
   let _size: size ?| List.length(apps) + 1
+  let _tags: tags ?| []
 
   # Security group for the cluster instances
   let sg: Fugue.AWS.EC2.SecurityGroup.new {
-    vpc: network.vpc,
+    vpc: _vpc,
     description: "ECS Cluster Container Instances",
     ipPermissions: List.concat(
       [
@@ -99,14 +106,15 @@ fun new {
           Fugue.AWS.EC2.IpPermission.Target.all
         ) for app in apps
       ]
-    )
+    ),
+    tags: _tags
   }
 
   # Cluster to hold the containers
   let clusterName: name ++ "-cluster"
   let cluster: Fugue.AWS.ECS.Cluster.new {
     name: clusterName,
-    region: network.region
+    region: _region
   }
 
   # Role for the clusters
@@ -127,7 +135,7 @@ fun new {
 
   # Launch configuration for instances in the cluster.
   let lc: Fugue.AWS.AutoScaling.LaunchConfiguration.new {
-    image: lookupEcsOptimizedImage(network.region),
+    image: lookupEcsOptimizedImage(_region),
     securityGroups: [sg],
     instanceType: Fugue.AWS.EC2.T2_large,
     keyName: keyName,
@@ -148,24 +156,28 @@ fun new {
   let asg: Fugue.AWS.AutoScaling.AutoScalingGroup.new {
     name: name ++ "-asg",
     launchConfiguration: lc,
-    subnets: network.publicSubnets,
+    subnets: subnets,
     loadBalancers: [],
     minSize: _size,
     maxSize: _size,
     defaultCooldown: 300,
-    healthCheckType: Fugue.AWS.AutoScaling.Ec2
+    healthCheckType: Fugue.AWS.AutoScaling.Ec2,
+    tags: _tags
   }
 
   # Now, we create a service for every app in our list.
   let services: [
     createServiceForApp {
-      network: network,
+      subnets: subnets,
+      vpc: vpc,
+      region: region,
       cluster: cluster,
+      tags: _tags,
       app: app
     } for app in apps
   ]
 
-  {
+  AppCluster {
     cluster: cluster,
     services: services,
     asg: asg
@@ -173,13 +185,18 @@ fun new {
 
 # Helper function: creating a service for an 'App' specification.
 fun createServiceForApp {
-  network: Fugue.AWS.Pattern.Network.Network,
+  subnets: List<Fugue.AWS.EC2.Subnet>,
+  vpc: Optional<Fugue.AWS.EC2.Vpc>,
+  region: Optional<Fugue.AWS.Region>,
   cluster: Fugue.AWS.ECS.Cluster,
+  tags: List<Fugue.AWS.Tag>,
   app: App
 } -> Fugue.AWS.ECS.Service:
+  let _vpc: Optional.unpack(List.index(subnets,0).(Fugue.AWS.EC2.Subnet).vpc, vpc)
+  let _region: Optional.unpack(_vpc.(Fugue.AWS.EC2.Vpc).region, region)
   # Security group for the cluster instances
   let sg: Fugue.AWS.EC2.SecurityGroup.new {
-    vpc: network.vpc,
+    vpc: _vpc,
     description: "ECS Cluster Container Instances",
     ipPermissions: [
       Fugue.AWS.EC2.IpPermission.http(
@@ -189,17 +206,18 @@ fun createServiceForApp {
         app.App.port,
         Fugue.AWS.EC2.IpPermission.Target.all
       )
-    ]
+    ],
+    tags: tags
   }
 
   # Load balancer for the app.
   let elb: Fugue.AWS.ELB.LoadBalancer.new {
     loadBalancerName: app.App.name ++ "-elb",
-    subnets: network.publicSubnets,
+    subnets: subnets,
     healthCheck: Fugue.AWS.ELB.HealthCheck.tcp {
       port: app.App.port,
-      interval: 100,
-      timeout: 60,
+      interval: 10,
+      timeout: 5,
       unhealthyThreshold: 6,
       healthyThreshold: 3,
     },
@@ -214,6 +232,7 @@ fun createServiceForApp {
         instancePort: app.App.port,
       },
     ],
+    tags: tags
   }
 
   # Container definition for the instances running the webapp
@@ -233,7 +252,7 @@ fun createServiceForApp {
   # The awslogs smart constructor is currently not exported so we need to use
   # the core type here.
   # Single element dictionary
-  let options0: { "awslogs-region": Fugue.AWS.Region.toString(network.region) }
+  let options0: { "awslogs-region": Fugue.AWS.Region.toString(_region) }
   let options:
     case app.App.logGroupName of
       # if app.App.logGroupName is None, just use options0
@@ -250,7 +269,7 @@ fun createServiceForApp {
   let task: Fugue.AWS.ECS.TaskDefinition.new {
     family: app.App.name ++ "-task",
     containerDefinitions: [containerDefinition],
-    region: network.region
+    region: _region
   }
 
   # Role for the service.

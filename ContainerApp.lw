@@ -24,7 +24,7 @@ network: Network.new {
 
 cluster: AppCluster.new {
   name: "app",
-  network: network,
+  subnets: network.publicSubnets,
   size: 1,
   keyName: "Demo",
   apps: [
