@@ -5,14 +5,14 @@ export
     type AppCluster
     new
 
-import Fugue.AWS.Pattern.Network
 import Fugue.AWS
 import Fugue.AWS.AutoScaling
 import Fugue.AWS.EC2
 import Fugue.AWS.ECS
 import Fugue.AWS.ELB
 import Fugue.AWS.IAM
-import Fugue.Core.Vars
+import Fugue.Random as Random
+
 
 # An app is basically a docker image together with some parameters.  You can
 # deploy multiple apps in an `AppCluster`.  For every app, the appropriate
@@ -25,6 +25,7 @@ type App:
       port: Int,
       memory: Int,
       managedPolicies: List<Fugue.AWS.IAM.ManagedPolicy>,
+      volumes: List<Fugue.AWS.ECS.Volume>,
       logGroupName: Optional<String>,
     }
 
@@ -49,7 +50,8 @@ fun app {
   logGroupName: Optional<String>,
   port: Optional<Int>,
   memory: Optional<Int>,
-  managedPolicies: Optional<List<Fugue.AWS.IAM.ManagedPolicy>>
+  managedPolicies: Optional<List<Fugue.AWS.IAM.ManagedPolicy>>,
+  volumes: Optional<List<Fugue.AWS.ECS.Volume>>
 } -> App:
   App {
     name: name,
@@ -57,7 +59,8 @@ fun app {
     port: port ?| 8000,
     memory: memory ?| 256,
     logGroupName: logGroupName,
-    managedPolicies: managedPolicies ?| []
+    managedPolicies: managedPolicies ?| [],
+    volumes: volumes ?| []
   }
 
 type AppCluster:
@@ -89,11 +92,12 @@ fun new {
   let _region: region ?| _vpc.(Fugue.AWS.EC2.Vpc).region
   let _size: size ?| List.length(apps) + 1
   let _tags: tags ?| []
+  let _random: Random.randomString{length: 8}
 
   # Security group for the cluster instances
   let sg: Fugue.AWS.EC2.SecurityGroup.new {
     vpc: _vpc,
-    description: "ECS Cluster Container Instances",
+    description: "ECS Cluster Container Instances " ++ _random,
     ipPermissions: List.concat(
       [
         Fugue.AWS.EC2.IpPermission.http(
@@ -111,7 +115,7 @@ fun new {
   }
 
   # Cluster to hold the containers
-  let clusterName: name ++ "-cluster"
+  let clusterName: name ++ "-cluster-" ++ _random
   let cluster: Fugue.AWS.ECS.Cluster.new {
     name: clusterName,
     region: _region
@@ -119,18 +123,13 @@ fun new {
 
   # Role for the clusters
   let clusterInstanceRole: Fugue.AWS.IAM.Role.new {
-    roleName: name ++ "-instance-role",
+    roleName: name ++ "-instance-role-" ++ _random,
     assumeRolePolicyDocument: Fugue.AWS.IAM.Policy.AssumeRole.ec2,
-    managedPolicies: List.concat(
-      [
-        Fugue.AWS.IAM.ManagedPolicy.external(
-          "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
-        )
-      ],
-      List.flatten [
-        app.App.managedPolicies for app in apps
-      ]
-    )
+    managedPolicies: [ 
+      Fugue.AWS.IAM.ManagedPolicy.external(
+        "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+      )
+    ]
   }
 
   # Launch configuration for instances in the cluster.
@@ -140,7 +139,7 @@ fun new {
     instanceType: Fugue.AWS.EC2.T2_large,
     keyName: keyName,
     iamInstanceProfile: Fugue.AWS.IAM.InstanceProfile.new {
-      instanceProfileName: name ++ "profile",
+      instanceProfileName: name ++ "-profile-" ++ _random,
       roles: [clusterInstanceRole]
     },
     userData: Template.render {
@@ -154,7 +153,7 @@ fun new {
 
   # Autoscaling group containing the actual instances in the cluster.
   let asg: Fugue.AWS.AutoScaling.AutoScalingGroup.new {
-    name: name ++ "-asg",
+    name: name ++ "-asg-" ++ _random,
     launchConfiguration: lc,
     subnets: subnets,
     loadBalancers: [],
@@ -162,7 +161,11 @@ fun new {
     maxSize: _size,
     defaultCooldown: 300,
     healthCheckType: Fugue.AWS.AutoScaling.Ec2,
-    tags: _tags
+    enabledMetrics: [
+      Fugue.AWS.AutoScaling.GroupInServiceInstances,
+      Fugue.AWS.AutoScaling.GroupTotalInstances
+    ],
+    tags: List.concat([Fugue.AWS.tag("Name", name ++ "-asg-" ++ _random)], _tags)
   }
 
   # Now, we create a service for every app in our list.
@@ -194,10 +197,12 @@ fun createServiceForApp {
 } -> Fugue.AWS.ECS.Service:
   let _vpc: Optional.unpack(List.index(subnets,0).(Fugue.AWS.EC2.Subnet).vpc, vpc)
   let _region: Optional.unpack(_vpc.(Fugue.AWS.EC2.Vpc).region, region)
+  let _random: Random.randomString{length: 8}
+
   # Security group for the cluster instances
   let sg: Fugue.AWS.EC2.SecurityGroup.new {
     vpc: _vpc,
-    description: "ECS Cluster Container Instances",
+    description: "ECS Cluster Container Instances " ++ _random,
     ipPermissions: [
       Fugue.AWS.EC2.IpPermission.http(
         Fugue.AWS.EC2.IpPermission.Target.all
@@ -212,7 +217,7 @@ fun createServiceForApp {
 
   # Load balancer for the app.
   let elb: Fugue.AWS.ELB.LoadBalancer.new {
-    loadBalancerName: app.App.name ++ "-elb",
+    loadBalancerName: app.App.name ++ "-" ++ _random ++ "-elb",
     subnets: subnets,
     healthCheck: Fugue.AWS.ELB.HealthCheck.tcp {
       port: app.App.port,
@@ -236,7 +241,7 @@ fun createServiceForApp {
   }
 
   # Container definition for the instances running the webapp
-  let containerName: app.App.name ++ "-container"
+  let containerName: app.App.name ++ "-" ++ _random ++ "-container"
   let containerDefinition: Fugue.AWS.ECS.ContainerDefinition.new {
     name: containerName,
     image: app.App.image,
@@ -265,16 +270,38 @@ fun createServiceForApp {
     options: options
   }
 
+  # Role for the task.
+  let taskRole: Fugue.AWS.IAM.Role.new {
+    roleName: app.App.name ++ "-" ++ _random ++ "-task-role",
+    assumeRolePolicyDocument: '{
+      \  "Version": "2008-10-17",
+      \  "Statement": [
+      \    {
+      \      "Sid": "",
+      \      "Effect": "Allow",
+      \      "Principal": {
+      \        "Service": "ecs-tasks.amazonaws.com"
+      \      },
+      \      "Action": "sts:AssumeRole"
+      \    }
+      \  ]
+      \}',
+    managedPolicies: app.App.managedPolicies,
+    rolePolicies: []
+  }
+
   # Task running the containers
   let task: Fugue.AWS.ECS.TaskDefinition.new {
-    family: app.App.name ++ "-task",
+    family: app.App.name ++ "-" ++ _random ++ "-task",
     containerDefinitions: [containerDefinition],
+    volumes: app.App.volumes,
+    role: taskRole,
     region: _region
   }
 
   # Role for the service.
   let serviceRole: Fugue.AWS.IAM.Role.new {
-    roleName: app.App.name ++ "-service-role",
+    roleName: app.App.name ++ "-" ++ _random ++ "-service-role",
     assumeRolePolicyDocument: '{
       \  "Version": "2008-10-17",
       \  "Statement": [
@@ -295,7 +322,7 @@ fun createServiceForApp {
     ],
     rolePolicies: [
       Fugue.AWS.IAM.Policy.new {
-        policyName: app.App.name ++ "-describe-instance-health",
+        policyName: app.App.name ++ "-" ++ _random ++ "-describe-instance-health",
         policyDocument: '{
           \  "Version": "2012-10-17",
           \  "Statement": [
@@ -311,7 +338,7 @@ fun createServiceForApp {
   }
 
   Fugue.AWS.ECS.Service.new {
-    name: app.App.name ++ "-service",
+    name: app.App.name ++ "-" ++ _random ++ "-service",
     cluster: cluster,
     taskDefinition: task,
     numDesired: 1,
@@ -322,8 +349,8 @@ fun createServiceForApp {
       loadBalancer: elb
     },
     deploymentConfiguration: Fugue.AWS.ECS.DeploymentConfiguration {
-      minimumHealthyPercent: 60,
-      maximumPercent: 150
+      minimumHealthyPercent: 50,
+      maximumPercent: 100
     }
   }
 
